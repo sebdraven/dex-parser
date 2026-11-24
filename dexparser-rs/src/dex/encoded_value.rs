@@ -64,12 +64,12 @@ pub fn decode_encoded_value(data: &[u8], mut pos: usize) -> Result<(EncodedValue
             Ok((EncodedValue::Long(v), np))
         }
         0x10 => {
-            let (bits, np) = read_unsigned(data, pos, value_arg, 4)?;
+            let (bits, np) = read_right_extended(data, pos, value_arg, 4)?;
             Ok((EncodedValue::Float(f32::from_bits(bits as u32)), np))
         }
         0x11 => {
-            let (bits, np) = read_unsigned(data, pos, value_arg, 8)?;
-            Ok((EncodedValue::Double(f64::from_bits(bits as u64)), np))
+            let (bits, np) = read_right_extended(data, pos, value_arg, 8)?;
+            Ok((EncodedValue::Double(f64::from_bits(bits)), np))
         }
         0x15 => {
             let (idx, np) = read_unsigned(data, pos, value_arg, 4)?;
@@ -165,8 +165,8 @@ pub fn encode_encoded_value(v: &EncodedValue) -> Vec<u8> {
         EncodedValue::Char(x) => encode_unsigned(0x03, *x as u64, 2),
         EncodedValue::Int(x) => encode_integral(0x04, *x as i64, 4),
         EncodedValue::Long(x) => encode_integral(0x06, *x, 8),
-        EncodedValue::Float(x) => encode_unsigned(0x10, x.to_bits() as u64, 4),
-        EncodedValue::Double(x) => encode_unsigned(0x11, x.to_bits(), 8),
+        EncodedValue::Float(x) => encode_right_extended(0x10, x.to_bits() as u64, 4),
+        EncodedValue::Double(x) => encode_right_extended(0x11, x.to_bits(), 8),
         EncodedValue::MethodType(i) => encode_unsigned(0x15, *i as u64, 4),
         EncodedValue::MethodHandle(i) => encode_unsigned(0x16, *i as u64, 4),
         EncodedValue::String(i) => encode_unsigned(0x17, *i as u64, 4),
@@ -263,6 +263,31 @@ fn read_unsigned(data: &[u8], pos: usize, value_arg: usize, max: usize) -> Resul
     let mut buf = [0u8; 8];
     buf[..n].copy_from_slice(&data[pos..pos + n]);
     Ok((u64::from_le_bytes(buf), pos + n))
+}
+
+/// VALUE_FLOAT / VALUE_DOUBLE: zero-extended to the right.
+fn encode_right_extended(value_type: u8, value: u64, max_bytes: usize) -> Vec<u8> {
+    let le = value.to_le_bytes();
+    let mut start = 0;
+    while start < max_bytes - 1 && le[start] == 0 {
+        start += 1;
+    }
+    let bytes = &le[start..max_bytes];
+    let arg = (bytes.len() - 1) as u8;
+    let mut out = vec![value_type | (arg << 5)];
+    out.extend_from_slice(bytes);
+    out
+}
+
+/// VALUE_FLOAT / VALUE_DOUBLE: zero-extended to the right.
+fn read_right_extended(
+    data: &[u8],
+    pos: usize,
+    value_arg: usize,
+    max: usize,
+) -> Result<(u64, usize)> {
+    let (v, np) = read_unsigned(data, pos, value_arg, max)?;
+    Ok((v << ((max - (value_arg + 1)) * 8), np))
 }
 
 /// Parse a dex-txt `.value` literal into an EncodedValue using string/type indices from callbacks.
@@ -635,5 +660,86 @@ mod tests {
             assert_eq!(end, bytes.len());
             assert_eq!(decoded, v);
         }
+    }
+
+    fn fp_vectors() -> Vec<(Vec<u8>, EncodedValue)> {
+        vec![
+            (vec![0x31, 0x14, 0x40], EncodedValue::Double(5.0)),
+            (vec![0x31, 0xE0, 0x3F], EncodedValue::Double(0.5)),
+            (vec![0x30, 0x80, 0x3F], EncodedValue::Float(1.0)),
+            (vec![0x70, 0x0A, 0xE8, 0x1C, 0x41], EncodedValue::Float(9.80665)),
+            (vec![0x11, 0x00], EncodedValue::Double(0.0)),
+            (vec![0x10, 0x00], EncodedValue::Float(0.0)),
+        ]
+    }
+
+    fn fp_bits(v: &EncodedValue) -> (char, u64) {
+        match v {
+            EncodedValue::Float(x) => ('F', x.to_bits() as u64),
+            EncodedValue::Double(x) => ('D', x.to_bits()),
+            other => panic!("not a float/double: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_float_double_right_extended() {
+        for (bytes, expected) in fp_vectors() {
+            let (v, end) = decode_encoded_value(&bytes, 0).unwrap();
+            assert_eq!(end, bytes.len());
+            assert_eq!(fp_bits(&v), fp_bits(&expected), "{bytes:02x?}");
+        }
+    }
+
+    #[test]
+    fn encode_float_double_right_extended() {
+        for (bytes, value) in fp_vectors() {
+            assert_eq!(encode_encoded_value(&value), bytes, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn roundtrip_float_double_bits() {
+        let doubles = [
+            0.0,
+            -0.0,
+            1.0,
+            5.0,
+            0.5,
+            f32::MAX as f64,
+            f64::MIN_POSITIVE,
+            std::f64::consts::PI,
+            f64::NAN,
+        ];
+        let floats = [
+            0.0,
+            -0.0,
+            1.0,
+            5.0,
+            0.5,
+            f32::MAX,
+            f32::MIN_POSITIVE,
+            std::f32::consts::PI,
+            f32::NAN,
+        ];
+        let values = doubles
+            .iter()
+            .map(|&d| EncodedValue::Double(d))
+            .chain(floats.iter().map(|&f| EncodedValue::Float(f)));
+        for v in values {
+            let bytes = encode_encoded_value(&v);
+            let (decoded, end) = decode_encoded_value(&bytes, 0).unwrap();
+            assert_eq!(end, bytes.len());
+            assert_eq!(fp_bits(&decoded), fp_bits(&v), "{v:?} -> {bytes:02x?}");
+        }
+    }
+
+    #[test]
+    fn integral_and_index_still_left_extended() {
+        let bytes: [u8; 3] = [0x24, 0x14, 0x40];
+        assert_eq!(encode_encoded_value(&EncodedValue::Int(0x4014)), bytes);
+        assert_eq!(decode_encoded_value(&bytes, 0).unwrap().0, EncodedValue::Int(0x4014));
+        let bytes: [u8; 3] = [0x37, 0x14, 0x40];
+        assert_eq!(encode_encoded_value(&EncodedValue::String(0x4014)), bytes);
+        assert_eq!(decode_encoded_value(&bytes, 0).unwrap().0, EncodedValue::String(0x4014));
     }
 }
